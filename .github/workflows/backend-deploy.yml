@@ -1,0 +1,107 @@
+name: Backend CI/CD
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend-deploy.yml"
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-central-1
+  ECR_REPOSITORY: aastu-clinic-backend
+  EC2_INSTANCE_ID: i-00f5942defa192a98
+
+jobs:
+  test:
+    name: Test Backend
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build TypeScript
+        run: npm run build
+
+  deploy:
+    name: Build and Deploy
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::516737672784:role/aastu-clinic-github-actions
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        working-directory: backend
+        run: |
+          docker build \
+            -t $ECR_REPOSITORY:${{ github.sha }} \
+            -t $ECR_REPOSITORY:latest \
+            .
+
+      - name: Tag Docker image
+        run: |
+          ECR_URI=516737672784.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}
+
+          docker tag \
+            $ECR_REPOSITORY:${{ github.sha }} \
+            $ECR_URI:${{ github.sha }}
+
+          docker tag \
+            $ECR_REPOSITORY:latest \
+            $ECR_URI:latest
+
+      - name: Push Docker image
+        run: |
+          ECR_URI=516737672784.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}
+
+          docker push $ECR_URI:${{ github.sha }}
+          docker push $ECR_URI:latest
+
+      - name: Deploy to EC2 through SSM
+        run: |
+          aws ssm send-command \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=[
+              "aws ecr get-login-password --region eu-central-1 | docker login --username AWS --password-stdin 516737672784.dkr.ecr.eu-central-1.amazonaws.com",
+              "docker pull 516737672784.dkr.ecr.eu-central-1.amazonaws.com/aastu-clinic-backend:${{ github.sha }}",
+              "docker stop aastu-clinic-backend || true",
+              "docker rm aastu-clinic-backend || true",
+              "docker run -d --name aastu-clinic-backend --restart unless-stopped -p 5000:5000 --env-file /home/ec2-user/clinic-production.env 516737672784.dkr.ecr.eu-central-1.amazonaws.com/aastu-clinic-backend:${{ github.sha }}",
+              "docker image prune -f"
+            ]' \
+            --comment "Deploy backend ${{ github.sha }}"
