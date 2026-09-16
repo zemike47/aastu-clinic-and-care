@@ -23,9 +23,29 @@ jobs:
     name: Test Backend
     runs-on: ubuntu-latest
 
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_DB: aastu_clinic_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U testuser -d aastu_clinic_test"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
     defaults:
       run:
         working-directory: backend
+
+    env:
+      DATABASE_URL: postgresql://testuser:testpassword@localhost:5432/aastu_clinic_test
+      JWT_SECRET: test-only-secret-for-ci
+      JWT_EXPIRES_IN: 1d
 
     steps:
       - name: Checkout
@@ -43,20 +63,15 @@ jobs:
 
       - name: Generate Prisma Client
         run: npx prisma generate
-        env:
-          DATABASE_URL: postgresql://build:build@localhost:5432/build
+
+      - name: Apply database migrations
+        run: npx prisma migrate deploy
 
       - name: Run tests
         run: npm test
-        env:
-          JWT_SECRET: test-only-secret-for-ci
-          JWT_EXPIRES_IN: 1d
-          DATABASE_URL: postgresql://build:build@localhost:5432/build
 
       - name: Build TypeScript
         run: npm run build
-        env:
-          DATABASE_URL: postgresql://build:build@localhost:5432/build
 
   deploy:
     name: Build and Deploy
