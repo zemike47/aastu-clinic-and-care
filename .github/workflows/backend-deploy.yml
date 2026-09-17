@@ -9,14 +9,16 @@ on:
       - ".github/workflows/backend-deploy.yml"
 
 permissions:
-  id-token: write
   contents: read
+  id-token: write
 
 env:
   AWS_REGION: eu-central-1
   ECR_REPOSITORY: aastu-clinic-backend
-  EC2_INSTANCE_ID: i-00f5942defa192a98
+  AWS_ACCOUNT_ID: "516737672784"
+  AWS_ROLE_ARN: arn:aws:iam::516737672784:role/aastu-clinic-github-actions
   ECR_URI: 516737672784.dkr.ecr.eu-central-1.amazonaws.com/aastu-clinic-backend
+  EC2_INSTANCE_ID: i-00f5942defa192a98
 
 jobs:
   test:
@@ -48,11 +50,11 @@ jobs:
       JWT_EXPIRES_IN: 1d
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
@@ -73,82 +75,114 @@ jobs:
       - name: Build TypeScript
         run: npm run build
 
-  deploy:
+  build-and-deploy:
     name: Build and Deploy
     needs: test
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Temporary diagnostic step.
+      # Prints OIDC claims only, never the actual JWT.
+      - name: Debug GitHub OIDC claims
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const token = await core.getIDToken("sts.amazonaws.com");
+
+            const payload = JSON.parse(
+              Buffer.from(token.split(".")[1], "base64url").toString()
+            );
+
+            console.log("OIDC issuer:", payload.iss);
+            console.log("OIDC audience:", payload.aud);
+            console.log("OIDC subject:", payload.sub);
+            console.log("Repository:", payload.repository);
+            console.log("Repository ID:", payload.repository_id);
+            console.log("Repository owner:", payload.repository_owner);
+            console.log("Repository owner ID:", payload.repository_owner_id);
+            console.log("Ref:", payload.ref);
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5
         with:
-          role-to-assume: arn:aws:iam::516737672784:role/aastu-clinic-github-actions
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build Docker image
-        working-directory: backend
         run: |
           docker build \
-            -t $ECR_REPOSITORY:${{ github.sha }} \
-            -t $ECR_REPOSITORY:latest \
-            .
+            -t ${{ env.ECR_REPOSITORY }}:${{ github.sha }} \
+            ./backend
 
       - name: Tag Docker image
         run: |
           docker tag \
-            $ECR_REPOSITORY:${{ github.sha }} \
-            $ECR_URI:${{ github.sha }}
-
-          docker tag \
-            $ECR_REPOSITORY:latest \
-            $ECR_URI:latest
+            ${{ env.ECR_REPOSITORY }}:${{ github.sha }} \
+            ${{ env.ECR_URI }}:${{ github.sha }}
 
       - name: Push Docker image
         run: |
-          docker push $ECR_URI:${{ github.sha }}
-          docker push $ECR_URI:latest
+          docker push \
+            ${{ env.ECR_URI }}:${{ github.sha }}
 
       - name: Deploy to EC2 through SSM
+        id: deploy
         run: |
+          IMAGE_URI="${{ env.ECR_URI }}:${{ github.sha }}"
+
           COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "$EC2_INSTANCE_ID" \
+            --instance-ids "${{ env.EC2_INSTANCE_ID }}" \
             --document-name "AWS-RunShellScript" \
-            --parameters 'commands=[
-              "aws ecr get-login-password --region eu-central-1 | docker login --username AWS --password-stdin 516737672784.dkr.ecr.eu-central-1.amazonaws.com",
-              "docker pull 516737672784.dkr.ecr.eu-central-1.amazonaws.com/aastu-clinic-backend:${{ github.sha }}",
-              "docker stop aastu-clinic-backend || true",
-              "docker rm aastu-clinic-backend || true",
-              "docker run -d --name aastu-clinic-backend --restart unless-stopped -p 5000:5000 --env-file /home/ec2-user/clinic-production.env 516737672784.dkr.ecr.eu-central-1.amazonaws.com/aastu-clinic-backend:${{ github.sha }}",
-              "docker image prune -f"
-            ]' \
-            --comment "Deploy backend ${{ github.sha }}" \
-            --query "Command.CommandId" \
+            --comment "AASTU Clinic deployment ${{ github.sha }}" \
+            --parameters "commands=[
+              \"aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com\",
+              \"docker pull $IMAGE_URI\",
+              \"docker stop aastu-clinic-backend || true\",
+              \"docker rm aastu-clinic-backend || true\",
+              \"docker run -d --name aastu-clinic-backend --restart unless-stopped -p 5000:5000 --env-file /home/ec2-user/clinic-production.env $IMAGE_URI\",
+              \"docker image prune -f\"
+            ]" \
+            --query 'Command.CommandId' \
             --output text)
 
           echo "SSM Command ID: $COMMAND_ID"
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for deployment
+        run: |
+          COMMAND_ID="${{ steps.deploy.outputs.command_id }}"
+
+          echo "Waiting for deployment on ${{ env.EC2_INSTANCE_ID }}..."
 
           aws ssm wait command-executed \
             --command-id "$COMMAND_ID" \
-            --instance-id "$EC2_INSTANCE_ID"
+            --instance-id "${{ env.EC2_INSTANCE_ID }}"
 
           STATUS=$(aws ssm get-command-invocation \
             --command-id "$COMMAND_ID" \
-            --instance-id "$EC2_INSTANCE_ID" \
-            --query "Status" \
+            --instance-id "${{ env.EC2_INSTANCE_ID }}" \
+            --query 'Status' \
             --output text)
 
           echo "Deployment status: $STATUS"
 
           if [ "$STATUS" != "Success" ]; then
+            echo "Deployment failed."
+
             aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \
-              --instance-id "$EC2_INSTANCE_ID"
+              --instance-id "${{ env.EC2_INSTANCE_ID }}" \
+              --query '{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}' \
+              --output json
 
             exit 1
           fi
+
+          echo "Deployment succeeded."
+ --
